@@ -831,6 +831,39 @@ impl<T> Arena<T> {
         self.free_list_head = Some(start);
     }
 
+    /// Shrink the capacity of the arena to its last occupied slot.
+    ///
+    /// The free slots after the last element go, so the arena keeps no memory
+    /// for them. The index of each element stays valid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use generational_arena::Arena;
+    ///
+    /// let mut arena = Arena::with_capacity(10);
+    /// let idx = arena.insert(42);
+    /// arena.shrink_to_fit();
+    /// assert_eq!(arena.capacity(), 1);
+    /// assert_eq!(arena[idx], 42);
+    /// ```
+    pub fn shrink_to_fit(&mut self) {
+        let end = self
+            .items
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::Occupied { .. }))
+            .map_or(0, |last| last + 1);
+        self.items.truncate(end);
+        self.items.shrink_to_fit();
+        self.free_list_head = None;
+        for (i, entry) in self.items.iter_mut().enumerate().rev() {
+            if let Entry::Free { next_free } = entry {
+                *next_free = self.free_list_head;
+                self.free_list_head = Some(i);
+            }
+        }
+    }
+
     /// Iterate over shared references to the elements in this arena.
     ///
     /// Yields pairs of `(Index, &T)` items.

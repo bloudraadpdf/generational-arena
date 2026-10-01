@@ -328,3 +328,22 @@ fn retain() {
     assert_eq!(arena.len(), 1);
     assert!(!arena.contains(index));
 }
+
+#[test]
+fn shrink_to_fit_drops_trailing_free_slots_and_reuses_inner_ones() {
+    let mut arena = Arena::with_capacity(8);
+    let a = arena.insert(1);
+    let b = arena.insert(2);
+    let c = arena.insert(3);
+    let d = arena.insert(4);
+    arena.remove(b);
+    arena.remove(d);
+    arena.shrink_to_fit();
+    assert_eq!(arena.capacity(), 3);
+    assert_eq!(arena.len(), 2);
+    assert_eq!((arena[a], arena[c]), (1, 3));
+    assert!(arena.get(b).is_none());
+    assert!(arena.try_insert(5).is_ok());
+    assert_eq!(arena.capacity(), 3);
+    assert!(arena.try_insert(6).is_err());
+}
