@@ -398,3 +398,13 @@ fn clear_across_chunks_frees_every_slot() {
     }
     assert!(arena.try_insert(0).is_err());
 }
+
+#[test]
+fn reserve_nothing_keeps_a_full_arena_full() {
+    let mut arena = Arena::with_capacity(1);
+    arena.insert(1);
+    arena.reserve(0);
+    assert!(arena.try_insert(2).is_err());
+    let index = arena.insert(3);
+    assert_eq!(arena[index], 3);
+}

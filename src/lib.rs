@@ -827,6 +827,9 @@ impl<T> Arena<T> {
     /// # let _: Arena<usize> = arena;
     /// ```
     pub fn reserve(&mut self, additional_capacity: usize) {
+        if additional_capacity == 0 {
+            return;
+        }
         let start = self.items.len();
         let end = self.items.len() + additional_capacity;
         let old_head = self.free_list_head;
