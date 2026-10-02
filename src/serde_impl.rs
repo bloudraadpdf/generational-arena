@@ -1,9 +1,9 @@
-use super::{Arena, Entry, Index, Vec, DEFAULT_CAPACITY};
+use super::{Arena, Entry, Generation, Index, Vec, DEFAULT_CAPACITY};
 use core::cmp;
 use core::fmt;
 use core::iter;
 use core::marker::PhantomData;
-use serde::de::{Deserialize, Deserializer, SeqAccess, Visitor};
+use serde::de::{Deserialize, Deserializer, Error, SeqAccess, Visitor};
 use serde::ser::{Serialize, Serializer};
 
 impl Serialize for Index {
@@ -13,7 +13,7 @@ impl Serialize for Index {
     {
         // Note: do not change the serialization format, or it may break
         // forward and backward compatibility of serialized data!
-        (self.index, self.generation).serialize(serializer)
+        self.into_raw_parts().serialize(serializer)
     }
 }
 
@@ -23,7 +23,8 @@ impl<'de> Deserialize<'de> for Index {
         D: Deserializer<'de>,
     {
         let (index, generation) = Deserialize::deserialize(deserializer)?;
-        Ok(Index { index, generation })
+        Index::try_from_raw_parts(index, generation)
+            .ok_or_else(|| D::Error::custom("the raw parts of an index exceed 32 bits"))
     }
 }
 
@@ -38,7 +39,7 @@ where
         // Note: do not change the serialization format, or it may break
         // forward and backward compatibility of serialized data!
         serializer.collect_seq(self.items.iter().map(|entry| match entry {
-            Entry::Occupied { generation, value } => Some((generation, value)),
+            Entry::Occupied { generation, value } => Some((generation.value(), value)),
             Entry::Free { .. } => None,
         }))
     }
@@ -85,10 +86,12 @@ where
         let init_cap = access.size_hint().unwrap_or(DEFAULT_CAPACITY);
         let mut items = Vec::with_capacity(init_cap);
 
-        let mut generation = 0;
+        let mut generation = Generation::FIRST;
         while let Some(element) = access.next_element::<Option<(u64, T)>>()? {
             let item = match element {
                 Some((gen, value)) => {
+                    let gen = Generation::from_value(gen)
+                        .ok_or_else(|| M::Error::custom("an arena generation exceeds 32 bits"))?;
                     generation = cmp::max(generation, gen);
                     Entry::Occupied {
                         generation: gen,
