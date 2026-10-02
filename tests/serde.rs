@@ -156,6 +156,7 @@ fn arena_from_iter_can_be_serialized_and_deserialized_without_panic() {
 /// `serde_test::assert_tokens` requires the value implements `PartialEq`,
 /// but `Arena` does not implement it.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de> + Clone"))]
 struct ArenaCompare<T>(Arena<T>);
 
 impl<'a, T> PartialEq for ArenaCompare<T>

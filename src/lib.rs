@@ -146,9 +146,11 @@ generational-arena = { version = "0.2", features = ["serde"] }
 cfg_if::cfg_if! {
     if #[cfg(feature = "std")] {
         extern crate std;
+        use std::sync::Arc;
         use std::vec::{self, Vec};
     } else {
         extern crate alloc;
+        use alloc::sync::Arc;
         use alloc::vec::{self, Vec};
     }
 }
@@ -279,13 +281,182 @@ impl Index {
 
 const DEFAULT_CAPACITY: usize = 4;
 
-impl<T> Default for Arena<T> {
+impl<T: Clone> Default for Arena<T> {
     fn default() -> Arena<T> {
         Arena::new()
     }
 }
 
 impl<T> Arena<T> {
+    /// Is the element at index `i` in the arena?
+    ///
+    /// Returns `true` if the element at `i` is in the arena, `false` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use generational_arena::Arena;
+    ///
+    /// let mut arena = Arena::new();
+    /// let idx = arena.insert(42);
+    ///
+    /// assert!(arena.contains(idx));
+    /// arena.remove(idx);
+    /// assert!(!arena.contains(idx));
+    /// ```
+    pub fn contains(&self, i: Index) -> bool {
+        self.get(i).is_some()
+    }
+
+    /// Get a shared reference to the element at index `i` if it is in the
+    /// arena.
+    ///
+    /// If the element at index `i` is not in the arena, then `None` is returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use generational_arena::Arena;
+    ///
+    /// let mut arena = Arena::new();
+    /// let idx = arena.insert(42);
+    ///
+    /// assert_eq!(arena.get(idx), Some(&42));
+    /// arena.remove(idx);
+    /// assert!(arena.get(idx).is_none());
+    /// ```
+    pub fn get(&self, i: Index) -> Option<&T> {
+        match self.items.get(i.slot()) {
+            Some(Entry::Occupied {
+                generation,
+                value,
+            }) if *generation == i.generation => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Get the length of this arena.
+    ///
+    /// The length is the number of elements the arena holds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use generational_arena::Arena;
+    ///
+    /// let mut arena = Arena::new();
+    /// assert_eq!(arena.len(), 0);
+    ///
+    /// let idx = arena.insert(42);
+    /// assert_eq!(arena.len(), 1);
+    ///
+    /// let _ = arena.insert(0);
+    /// assert_eq!(arena.len(), 2);
+    ///
+    /// assert_eq!(arena.remove(idx), Some(42));
+    /// assert_eq!(arena.len(), 1);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if the arena contains no elements
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use generational_arena::Arena;
+    ///
+    /// let mut arena = Arena::new();
+    /// assert!(arena.is_empty());
+    ///
+    /// let idx = arena.insert(42);
+    /// assert!(!arena.is_empty());
+    ///
+    /// assert_eq!(arena.remove(idx), Some(42));
+    /// assert!(arena.is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Get the capacity of this arena.
+    ///
+    /// The capacity is the maximum number of elements the arena can hold
+    /// without further allocation, including however many it currently
+    /// contains.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use generational_arena::Arena;
+    ///
+    /// let mut arena = Arena::with_capacity(10);
+    /// assert_eq!(arena.capacity(), 10);
+    ///
+    /// // `try_insert` does not allocate new capacity.
+    /// for i in 0..10 {
+    ///     assert!(arena.try_insert(1).is_ok());
+    ///     assert_eq!(arena.capacity(), 10);
+    /// }
+    ///
+    /// // But `insert` will if the arena is already at capacity.
+    /// arena.insert(0);
+    /// assert!(arena.capacity() > 10);
+    /// ```
+    pub fn capacity(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Iterate over shared references to the elements in this arena.
+    ///
+    /// Yields pairs of `(Index, &T)` items.
+    ///
+    /// Order of iteration is not defined.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use generational_arena::Arena;
+    ///
+    /// let mut arena = Arena::new();
+    /// for i in 0..10 {
+    ///     arena.insert(i * i);
+    /// }
+    ///
+    /// for (idx, value) in arena.iter() {
+    ///     println!("{} is at index {:?}", value, idx);
+    /// }
+    /// ```
+    pub fn iter(&self) -> Iter<T> {
+        Iter {
+            len: self.len,
+            inner: self.items.iter(),
+        }
+    }
+
+    /// Given an i of `usize` without a generation, get a shared reference
+    /// to the element and the matching `Index` of the entry behind `i`.
+    ///
+    /// This method is useful when you know there might be an element at the
+    /// position i, but don't know its generation or precise Index.
+    ///
+    /// Use cases include using indexing such as Hierarchical BitMap Indexing or
+    /// other kinds of bit-efficient indexing.
+    ///
+    /// You should use the `get` method instead most of the time.
+    pub fn get_unknown_gen(&self, i: usize) -> Option<(&T, Index)> {
+        match self.items.get(i) {
+            Some(Entry::Occupied {
+                generation,
+                value,
+            }) => Some((value, Index::at(i, *generation))),
+            _ => None,
+        }
+    }
+}
+
+impl<T: Clone> Arena<T> {
     /// Constructs a new, empty `Arena`.
     ///
     /// # Examples
@@ -595,53 +766,6 @@ impl<T> Arena<T> {
         }
     }
 
-    /// Is the element at index `i` in the arena?
-    ///
-    /// Returns `true` if the element at `i` is in the arena, `false` otherwise.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use generational_arena::Arena;
-    ///
-    /// let mut arena = Arena::new();
-    /// let idx = arena.insert(42);
-    ///
-    /// assert!(arena.contains(idx));
-    /// arena.remove(idx);
-    /// assert!(!arena.contains(idx));
-    /// ```
-    pub fn contains(&self, i: Index) -> bool {
-        self.get(i).is_some()
-    }
-
-    /// Get a shared reference to the element at index `i` if it is in the
-    /// arena.
-    ///
-    /// If the element at index `i` is not in the arena, then `None` is returned.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use generational_arena::Arena;
-    ///
-    /// let mut arena = Arena::new();
-    /// let idx = arena.insert(42);
-    ///
-    /// assert_eq!(arena.get(idx), Some(&42));
-    /// arena.remove(idx);
-    /// assert!(arena.get(idx).is_none());
-    /// ```
-    pub fn get(&self, i: Index) -> Option<&T> {
-        match self.items.get(i.slot()) {
-            Some(Entry::Occupied {
-                generation,
-                value,
-            }) if *generation == i.generation => Some(value),
-            _ => None,
-        }
-    }
-
     /// Get an exclusive reference to the element at index `i` if it is in the
     /// arena.
     ///
@@ -737,79 +861,6 @@ impl<T> Arena<T> {
         (item1, item2)
     }
 
-    /// Get the length of this arena.
-    ///
-    /// The length is the number of elements the arena holds.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use generational_arena::Arena;
-    ///
-    /// let mut arena = Arena::new();
-    /// assert_eq!(arena.len(), 0);
-    ///
-    /// let idx = arena.insert(42);
-    /// assert_eq!(arena.len(), 1);
-    ///
-    /// let _ = arena.insert(0);
-    /// assert_eq!(arena.len(), 2);
-    ///
-    /// assert_eq!(arena.remove(idx), Some(42));
-    /// assert_eq!(arena.len(), 1);
-    /// ```
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Returns true if the arena contains no elements
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use generational_arena::Arena;
-    ///
-    /// let mut arena = Arena::new();
-    /// assert!(arena.is_empty());
-    ///
-    /// let idx = arena.insert(42);
-    /// assert!(!arena.is_empty());
-    ///
-    /// assert_eq!(arena.remove(idx), Some(42));
-    /// assert!(arena.is_empty());
-    /// ```
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Get the capacity of this arena.
-    ///
-    /// The capacity is the maximum number of elements the arena can hold
-    /// without further allocation, including however many it currently
-    /// contains.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use generational_arena::Arena;
-    ///
-    /// let mut arena = Arena::with_capacity(10);
-    /// assert_eq!(arena.capacity(), 10);
-    ///
-    /// // `try_insert` does not allocate new capacity.
-    /// for i in 0..10 {
-    ///     assert!(arena.try_insert(1).is_ok());
-    ///     assert_eq!(arena.capacity(), 10);
-    /// }
-    ///
-    /// // But `insert` will if the arena is already at capacity.
-    /// arena.insert(0);
-    /// assert!(arena.capacity() > 10);
-    /// ```
-    pub fn capacity(&self) -> usize {
-        self.items.len()
-    }
-
     /// Allocate space for `additional_capacity` more elements in the arena.
     ///
     /// # Panics
@@ -886,33 +937,6 @@ impl<T> Arena<T> {
         }
     }
 
-    /// Iterate over shared references to the elements in this arena.
-    ///
-    /// Yields pairs of `(Index, &T)` items.
-    ///
-    /// Order of iteration is not defined.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use generational_arena::Arena;
-    ///
-    /// let mut arena = Arena::new();
-    /// for i in 0..10 {
-    ///     arena.insert(i * i);
-    /// }
-    ///
-    /// for (idx, value) in arena.iter() {
-    ///     println!("{} is at index {:?}", value, idx);
-    /// }
-    /// ```
-    pub fn iter(&self) -> Iter<T> {
-        Iter {
-            len: self.len,
-            inner: self.items.iter(),
-        }
-    }
-
     /// Iterate over exclusive references to the elements in this arena.
     ///
     /// Yields pairs of `(Index, &mut T)` items.
@@ -980,26 +1004,6 @@ impl<T> Arena<T> {
         }
     }
 
-    /// Given an i of `usize` without a generation, get a shared reference
-    /// to the element and the matching `Index` of the entry behind `i`.
-    ///
-    /// This method is useful when you know there might be an element at the
-    /// position i, but don't know its generation or precise Index.
-    ///
-    /// Use cases include using indexing such as Hierarchical BitMap Indexing or
-    /// other kinds of bit-efficient indexing.
-    ///
-    /// You should use the `get` method instead most of the time.
-    pub fn get_unknown_gen(&self, i: usize) -> Option<(&T, Index)> {
-        match self.items.get(i) {
-            Some(Entry::Occupied {
-                generation,
-                value,
-            }) => Some((value, Index::at(i, *generation))),
-            _ => None,
-        }
-    }
-
     /// Given an i of `usize` without a generation, get an exclusive reference
     /// to the element and the matching `Index` of the entry behind `i`.
     ///
@@ -1021,7 +1025,7 @@ impl<T> Arena<T> {
     }
 }
 
-impl<T> IntoIterator for Arena<T> {
+impl<T: Clone> IntoIterator for Arena<T> {
     type Item = T;
     type IntoIter = IntoIter<T>;
     fn into_iter(self) -> Self::IntoIter {
@@ -1206,7 +1210,7 @@ impl<'a, T> ExactSizeIterator for Iter<'a, T> {
 
 impl<'a, T> FusedIterator for Iter<'a, T> {}
 
-impl<'a, T> IntoIterator for &'a mut Arena<T> {
+impl<'a, T: Clone> IntoIterator for &'a mut Arena<T> {
     type Item = (Index, &'a mut T);
     type IntoIter = IterMut<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
@@ -1387,7 +1391,7 @@ impl<'a, T> ExactSizeIterator for Drain<'a, T> {
 
 impl<'a, T> FusedIterator for Drain<'a, T> {}
 
-impl<T> Extend<T> for Arena<T> {
+impl<T: Clone> Extend<T> for Arena<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         for t in iter {
             self.insert(t);
@@ -1395,7 +1399,7 @@ impl<T> Extend<T> for Arena<T> {
     }
 }
 
-impl<T> FromIterator<T> for Arena<T> {
+impl<T: Clone> FromIterator<T> for Arena<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let iter = iter.into_iter();
         let (lower, upper) = iter.size_hint();
@@ -1415,7 +1419,7 @@ impl<T> ops::Index<Index> for Arena<T> {
     }
 }
 
-impl<T> ops::IndexMut<Index> for Arena<T> {
+impl<T: Clone> ops::IndexMut<Index> for Arena<T> {
     fn index_mut(&mut self, index: Index) -> &mut Self::Output {
         self.get_mut(index).expect("No element at index")
     }

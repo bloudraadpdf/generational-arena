@@ -408,3 +408,29 @@ fn reserve_nothing_keeps_a_full_arena_full() {
     let index = arena.insert(3);
     assert_eq!(arena[index], 3);
 }
+
+#[test]
+fn a_clone_shares_its_chunks_until_a_write() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CLONES: AtomicUsize = AtomicUsize::new(0);
+    #[derive(Debug, PartialEq)]
+    struct Counted(usize);
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            CLONES.fetch_add(1, Ordering::Relaxed);
+            Counted(self.0)
+        }
+    }
+    let mut arena = Arena::new();
+    let indices: Vec<_> = (0..10_000).map(|i| arena.insert(Counted(i))).collect();
+    CLONES.store(0, Ordering::Relaxed);
+    let mut copy = arena.clone();
+    assert_eq!(CLONES.load(Ordering::Relaxed), 0);
+    copy[indices[5_000]] = Counted(0);
+    // A write copies one chunk of 64 KiB, and an entry takes at least 16 bytes.
+    let copied = CLONES.load(Ordering::Relaxed);
+    assert!(copied > 0 && copied <= 4096, "{copied} clones");
+    assert_eq!((&arena[indices[5_000]], &copy[indices[5_000]]), (&Counted(5_000), &Counted(0)));
+    assert_eq!(arena.remove(indices[4]), Some(Counted(4)));
+    assert_eq!(copy[indices[4]], Counted(4));
+}

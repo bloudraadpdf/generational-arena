@@ -1,19 +1,25 @@
-use super::{vec, Entry, Vec};
+use super::{vec, Arc, Entry, Vec};
 use core::{cmp, iter, mem, ops, slice};
 
 const CHUNK_BYTES: usize = 64 * 1024;
 
 /// The slots of an arena in chunks of about `CHUNK_BYTES`. Each chunk but the last is full, so the arena grows
-/// without a copy of its slots and keeps less than one chunk of spare slots.
+/// without a copy of its slots and keeps less than one chunk of spare slots. A clone shares each chunk until one of
+/// the two changes it.
 #[derive(Clone, Debug)]
 pub(crate) struct Slots<T> {
-    chunks: Vec<Vec<Entry<T>>>,
+    chunks: Vec<Chunk<T>>,
 }
 
-pub(crate) type SlotIter<'a, T> = Positions<iter::Flatten<slice::Iter<'a, Vec<Entry<T>>>>>;
-pub(crate) type SlotIterMut<'a, T> = Positions<iter::Flatten<slice::IterMut<'a, Vec<Entry<T>>>>>;
-pub(crate) type SlotDrain<'a, T> = Positions<iter::Flatten<vec::Drain<'a, Vec<Entry<T>>>>>;
-pub(crate) type SlotIntoIter<T> = iter::Flatten<vec::IntoIter<Vec<Entry<T>>>>;
+type Chunk<T> = Arc<[Entry<T>]>;
+type Shared<'a, T> = fn(&'a Chunk<T>) -> &'a [Entry<T>];
+type Unique<'a, T> = fn(&'a mut Chunk<T>) -> &'a mut [Entry<T>];
+type Take<T> = fn(Chunk<T>) -> Vec<Entry<T>>;
+
+pub(crate) type SlotIter<'a, T> = Positions<iter::Flatten<iter::Map<slice::Iter<'a, Chunk<T>>, Shared<'a, T>>>>;
+pub(crate) type SlotIterMut<'a, T> = Positions<iter::Flatten<iter::Map<slice::IterMut<'a, Chunk<T>>, Unique<'a, T>>>>;
+pub(crate) type SlotDrain<'a, T> = Positions<iter::Flatten<iter::Map<vec::Drain<'a, Chunk<T>>, Take<T>>>>;
+pub(crate) type SlotIntoIter<T> = iter::Flatten<iter::Map<vec::IntoIter<Chunk<T>>, Take<T>>>;
 
 impl<T> Slots<T> {
     const CHUNK_LEN: usize = CHUNK_BYTES.div_ceil(mem::size_of::<Entry<T>>());
@@ -43,16 +49,23 @@ impl<T> Slots<T> {
         self.chunks.get(chunk)?.get(offset)
     }
 
+    pub(crate) fn iter(&self) -> SlotIter<'_, T> {
+        let shared: Shared<'_, T> = AsRef::as_ref;
+        Positions::new(self.len(), self.chunks.iter().map(shared).flatten())
+    }
+}
+
+impl<T: Clone> Slots<T> {
     pub(crate) fn get_mut(&mut self, slot: usize) -> Option<&mut Entry<T>> {
         let (chunk, offset) = Self::position(slot);
-        self.chunks.get_mut(chunk)?.get_mut(offset)
+        Arc::make_mut(self.chunks.get_mut(chunk)?).get_mut(offset)
     }
 
     /// Panics if `a` and `b` are the same slot or either is out of range.
     pub(crate) fn pair_mut(&mut self, a: usize, b: usize) -> [&mut Entry<T>; 2] {
         let ((chunk_a, offset_a), (chunk_b, offset_b)) = (Self::position(a), Self::position(b));
         if chunk_a == chunk_b {
-            self.chunks[chunk_a]
+            Arc::make_mut(&mut self.chunks[chunk_a])
                 .get_disjoint_mut([offset_a, offset_b])
                 .expect("two distinct slots")
         } else {
@@ -60,56 +73,61 @@ impl<T> Slots<T> {
                 .chunks
                 .get_disjoint_mut([chunk_a, chunk_b])
                 .expect("two distinct chunks");
-            [&mut a[offset_a], &mut b[offset_b]]
+            [&mut Arc::make_mut(a)[offset_a], &mut Arc::make_mut(b)[offset_b]]
         }
     }
 
     pub(crate) fn extend(&mut self, mut entries: impl ExactSizeIterator<Item = Entry<T>>) {
         while entries.len() > 0 {
-            if self.chunks.last().map_or(true, |last| last.len() == Self::CHUNK_LEN) {
-                self.chunks.push(Vec::new());
-            }
-            let last = self.chunks.last_mut().expect("a chunk with free room");
-            let room = cmp::min(entries.len(), Self::CHUNK_LEN - last.len());
-            last.reserve_exact(room);
-            last.extend(entries.by_ref().take(room));
+            let kept = if self.chunks.last().is_some_and(|last| last.len() < Self::CHUNK_LEN) {
+                self.chunks.pop().map_or_else(Vec::new, take)
+            } else {
+                Vec::new()
+            };
+            let room = cmp::min(entries.len(), Self::CHUNK_LEN - kept.len());
+            self.chunks
+                .push(kept.into_iter().chain(entries.by_ref().take(room)).collect());
         }
     }
 
     pub(crate) fn truncate(&mut self, len: usize) {
         let (full, rest) = Self::position(len);
         self.chunks.truncate(full + usize::from(rest > 0));
-        if let Some(last) = self.chunks.get_mut(full) {
+        if self.chunks.get(full).is_some_and(|last| last.len() > rest) {
+            let mut last = self.chunks.pop().map_or_else(Vec::new, take);
             last.truncate(rest);
+            self.chunks.push(last.into());
         }
     }
 
     pub(crate) fn shrink_to_fit(&mut self) {
         self.chunks.shrink_to_fit();
-        for chunk in &mut self.chunks {
-            chunk.shrink_to_fit();
-        }
-    }
-
-    pub(crate) fn iter(&self) -> SlotIter<'_, T> {
-        Positions::new(self.len(), self.chunks.iter().flatten())
     }
 
     pub(crate) fn iter_mut(&mut self) -> SlotIterMut<'_, T> {
-        Positions::new(self.len(), self.chunks.iter_mut().flatten())
+        let unique: Unique<'_, T> = Arc::make_mut;
+        Positions::new(self.len(), self.chunks.iter_mut().map(unique).flatten())
     }
 
     pub(crate) fn drain(&mut self) -> SlotDrain<'_, T> {
-        Positions::new(self.len(), self.chunks.drain(..).flatten())
+        Positions::new(self.len(), self.chunks.drain(..).map(take as Take<T>).flatten())
     }
 }
 
-impl<T> IntoIterator for Slots<T> {
+/// The entries of `chunk`, without a copy if no other arena shares it.
+fn take<T: Clone>(mut chunk: Chunk<T>) -> Vec<Entry<T>> {
+    Arc::make_mut(&mut chunk)
+        .iter_mut()
+        .map(|entry| mem::replace(entry, Entry::Free { next_free: None }))
+        .collect()
+}
+
+impl<T: Clone> IntoIterator for Slots<T> {
     type Item = Entry<T>;
     type IntoIter = SlotIntoIter<T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.chunks.into_iter().flatten()
+        self.chunks.into_iter().map(take as Take<T>).flatten()
     }
 }
 
@@ -122,10 +140,10 @@ impl<T> ops::Index<usize> for Slots<T> {
     }
 }
 
-impl<T> ops::IndexMut<usize> for Slots<T> {
+impl<T: Clone> ops::IndexMut<usize> for Slots<T> {
     fn index_mut(&mut self, slot: usize) -> &mut Entry<T> {
         let (chunk, offset) = Self::position(slot);
-        &mut self.chunks[chunk][offset]
+        &mut Arc::make_mut(&mut self.chunks[chunk])[offset]
     }
 }
 

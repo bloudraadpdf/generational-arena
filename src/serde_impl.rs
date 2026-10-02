@@ -46,7 +46,7 @@ where
 
 impl<'de, T> Deserialize<'de> for Arena<T>
 where
-    T: Deserialize<'de>,
+    T: Deserialize<'de> + Clone,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -70,7 +70,7 @@ impl<T> ArenaVisitor<T> {
 
 impl<'de, T> Visitor<'de> for ArenaVisitor<T>
 where
-    T: Deserialize<'de>,
+    T: Deserialize<'de> + Clone,
 {
     type Value = Arena<T>;
 
