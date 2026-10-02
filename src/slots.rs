@@ -1,7 +1,7 @@
 use super::{vec, Arc, Entry, Vec};
 use core::{cmp, iter, mem, ops, slice};
 
-const CHUNK_BYTES: usize = 64 * 1024;
+const CHUNK_BYTES: usize = 4 * 1024;
 
 /// The slots of an arena in chunks of about `CHUNK_BYTES`. Each chunk but the last is full, so the arena grows
 /// without a copy of its slots and keeps less than one chunk of spare slots. A clone shares each chunk until one of

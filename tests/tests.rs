@@ -354,8 +354,8 @@ fn growth_keeps_less_than_one_chunk_of_free_slots() {
     for i in 0..100_000u64 {
         arena.insert(i);
     }
-    // A chunk holds 64 KiB, and an entry takes at least 16 bytes.
-    assert!(arena.capacity() - arena.len() < 4096);
+    // A chunk holds 4 KiB, and an entry takes at least 16 bytes.
+    assert!(arena.capacity() - arena.len() < 256);
 }
 
 #[test]
@@ -427,9 +427,9 @@ fn a_clone_shares_its_chunks_until_a_write() {
     let mut copy = arena.clone();
     assert_eq!(CLONES.load(Ordering::Relaxed), 0);
     copy[indices[5_000]] = Counted(0);
-    // A write copies one chunk of 64 KiB, and an entry takes at least 16 bytes.
+    // A write copies one chunk of 4 KiB, and an entry takes at least 16 bytes.
     let copied = CLONES.load(Ordering::Relaxed);
-    assert!(copied > 0 && copied <= 4096, "{copied} clones");
+    assert!(copied > 0 && copied <= 256, "{copied} clones");
     assert_eq!((&arena[indices[5_000]], &copy[indices[5_000]]), (&Counted(5_000), &Counted(0)));
     assert_eq!(arena.remove(indices[4]), Some(Counted(4)));
     assert_eq!(copy[indices[4]], Counted(4));
