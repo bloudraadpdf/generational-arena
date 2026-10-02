@@ -347,3 +347,54 @@ fn shrink_to_fit_drops_trailing_free_slots_and_reuses_inner_ones() {
     assert_eq!(arena.capacity(), 3);
     assert!(arena.try_insert(6).is_err());
 }
+
+#[test]
+fn growth_keeps_less_than_one_chunk_of_free_slots() {
+    let mut arena = Arena::new();
+    for i in 0..100_000u64 {
+        arena.insert(i);
+    }
+    // A chunk holds 64 KiB, and an entry takes at least 16 bytes.
+    assert!(arena.capacity() - arena.len() < 4096);
+}
+
+#[test]
+fn slots_across_chunks_keep_their_positions() {
+    let mut arena = Arena::new();
+    let indices: Vec<_> = (0..10_000).map(|i| arena.insert(i)).collect();
+    assert!(arena.iter().map(|(index, _)| index).eq(indices.iter().copied()));
+    assert!(arena
+        .iter_mut()
+        .rev()
+        .map(|(index, _)| index)
+        .eq(indices.iter().rev().copied()));
+    for &(a, b) in &[(0, 9_999), (9_998, 5), (4_000, 4_001)] {
+        let (x, y) = arena.get2_mut(indices[a], indices[b]);
+        assert_eq!((x.copied(), y.copied()), (Some(a), Some(b)));
+    }
+    for &index in &indices[5_000..] {
+        arena.remove(index);
+    }
+    arena.shrink_to_fit();
+    assert_eq!(arena.capacity(), 5_000);
+    assert!(arena.try_insert(0).is_err());
+    assert!(arena
+        .drain()
+        .map(|(index, _)| index)
+        .eq(indices[..5_000].iter().copied()));
+    assert_eq!(arena.capacity(), 0);
+}
+
+#[test]
+fn clear_across_chunks_frees_every_slot() {
+    let mut arena = Arena::new();
+    for i in 0..10_000 {
+        arena.insert(i);
+    }
+    let capacity = arena.capacity();
+    arena.clear();
+    for i in 0..capacity {
+        assert!(arena.try_insert(i).is_ok());
+    }
+    assert!(arena.try_insert(0).is_err());
+}

@@ -186,3 +186,21 @@ where
     assert_ser_tokens(value, tokens);
     assert_de_tokens(value, tokens);
 }
+
+#[test]
+fn arena_across_chunks_round_trips() {
+    let mut arena = Arena::new();
+    let indices: Vec<_> = (0..10_000u64).map(|i| arena.insert(i)).collect();
+    for &index in indices.iter().step_by(3) {
+        arena.remove(index);
+    }
+    let bytes = bincode::serialize(&arena).expect("arena must be serialized");
+    let mut copy = bincode::deserialize::<Arena<u64>>(&bytes).expect("arena must be deserialized");
+    assert!(copy.iter().eq(arena.iter()));
+    assert_eq!(copy.capacity(), arena.capacity());
+    let free = copy.capacity() - copy.len();
+    for i in 0..free {
+        assert!(copy.try_insert(i as u64).is_ok());
+    }
+    assert!(copy.try_insert(0).is_err());
+}

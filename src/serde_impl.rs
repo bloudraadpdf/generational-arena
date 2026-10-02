@@ -1,7 +1,6 @@
-use super::{Arena, Entry, Generation, Index, Vec, DEFAULT_CAPACITY};
+use super::{Arena, Entry, Generation, Index, Slots, Vec, DEFAULT_CAPACITY};
 use core::cmp;
 use core::fmt;
-use core::iter;
 use core::marker::PhantomData;
 use serde::de::{Deserialize, Deserializer, Error, SeqAccess, Visitor};
 use serde::ser::{Serialize, Serializer};
@@ -38,7 +37,7 @@ where
     {
         // Note: do not change the serialization format, or it may break
         // forward and backward compatibility of serialized data!
-        serializer.collect_seq(self.items.iter().map(|entry| match entry {
+        serializer.collect_seq(self.items.iter().map(|(_, entry)| match entry {
             Entry::Occupied { generation, value } => Some((generation.value(), value)),
             Entry::Free { .. } => None,
         }))
@@ -84,15 +83,17 @@ where
         M: SeqAccess<'de>,
     {
         let init_cap = access.size_hint().unwrap_or(DEFAULT_CAPACITY);
-        let mut items = Vec::with_capacity(init_cap);
+        let mut entries = Vec::with_capacity(init_cap);
 
         let mut generation = Generation::FIRST;
+        let mut len = 0;
         while let Some(element) = access.next_element::<Option<(u64, T)>>()? {
-            let item = match element {
+            let entry = match element {
                 Some((gen, value)) => {
                     let gen = Generation::from_value(gen)
                         .ok_or_else(|| M::Error::custom("an arena generation exceeds 32 bits"))?;
                     generation = cmp::max(generation, gen);
+                    len += 1;
                     Entry::Occupied {
                         generation: gen,
                         value,
@@ -100,34 +101,18 @@ where
                 }
                 None => Entry::Free { next_free: None },
             };
-            items.push(item);
+            entries.push(entry);
         }
 
-        // items.len() must be same as item.capacity(), so fill the unused elements with Free.
-        if items.len() < items.capacity() {
-            let add_cap = items.capacity() - items.len();
-            items.reserve_exact(add_cap);
-            items.extend(iter::repeat_with(|| Entry::Free { next_free: None }).take(add_cap));
-            debug_assert_eq!(items.len(), items.capacity());
-        }
-
-        let mut free_list_head = None;
-        let mut len = items.len();
-        // Iterates `arena.items` in reverse order so that free_list concatenates
-        // indices in ascending order.
-        for (idx, entry) in items.iter_mut().enumerate().rev() {
-            if let Entry::Free { next_free } = entry {
-                *next_free = free_list_head;
-                free_list_head = Some(idx);
-                len -= 1;
-            }
-        }
-
-        Ok(Arena {
+        let mut items = Slots::new();
+        items.extend(entries.into_iter());
+        let mut arena = Arena {
             items,
             generation,
-            free_list_head,
+            free_list_head: None,
             len,
-        })
+        };
+        arena.relink_free_list();
+        Ok(arena)
     }
 }

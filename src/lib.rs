@@ -154,16 +154,18 @@ cfg_if::cfg_if! {
 }
 
 use core::cmp;
-use core::iter::{self, Extend, FromIterator, FusedIterator};
+use core::iter::{Extend, FromIterator, FusedIterator};
 use core::convert::TryFrom;
 use core::fmt;
 use core::mem;
 use core::num::NonZeroU32;
 use core::ops;
-use core::slice;
 
 #[cfg(feature = "serde")]
 mod serde_impl;
+mod slots;
+
+use slots::{SlotDrain, SlotIntoIter, SlotIter, SlotIterMut, Slots};
 
 /// The `Arena` allows inserting and removing elements that are referred to by
 /// `Index`.
@@ -171,7 +173,7 @@ mod serde_impl;
 /// [See the module-level documentation for example usage and motivation.](./index.html)
 #[derive(Clone, Debug)]
 pub struct Arena<T> {
-    items: Vec<Entry<T>>,
+    items: Slots<T>,
     generation: Generation,
     free_list_head: Option<usize>,
     len: usize,
@@ -320,7 +322,7 @@ impl<T> Arena<T> {
     pub fn with_capacity(n: usize) -> Arena<T> {
         let n = cmp::max(n, 1);
         let mut arena = Arena {
-            items: Vec::new(),
+            items: Slots::new(),
             generation: Generation::FIRST,
             free_list_head: None,
             len: 0,
@@ -345,25 +347,16 @@ impl<T> Arena<T> {
     /// assert_eq!(arena.capacity(), 2);
     /// ```
     pub fn clear(&mut self) {
-        self.items.clear();
-
-        let end = self.items.capacity();
-        self.items.extend((0..end).map(|i| {
-            if i == end - 1 {
-                Entry::Free { next_free: None }
-            } else {
-                Entry::Free {
-                    next_free: Some(i + 1),
-                }
-            }
-        }));
+        for (_, entry) in self.items.iter_mut() {
+            *entry = Entry::Free { next_free: None };
+        }
         if !self.is_empty() {
             // Increment generation, but if there are no elements, do nothing to
             // avoid unnecessary incrementing generation.
             self.generation = self.generation.next();
         }
-        self.free_list_head = Some(0);
         self.len = 0;
+        self.relink_free_list();
     }
 
     /// Attempts to insert `value` into the arena using existing capacity.
@@ -510,20 +503,7 @@ impl<T> Arena<T> {
 
     #[inline(never)]
     fn insert_slow_path(&mut self, value: T) -> Index {
-        let len = if self.capacity() == 0 {
-            // `drain()` sets the capacity to 0 and if the capacity is 0, the
-            // next `try_insert() `will refer to an out-of-range index because
-            // the next `reserve()` does not add element, resulting in a panic.
-            // So ensure that `self` have at least 1 capacity here.
-            //
-            // Ideally, this problem should be handled within `drain()`,but
-            // this problem cannot be handled within `drain()` because `drain()`
-            // returns an iterator that borrows `self` mutably.
-            1
-        } else {
-            self.items.len()
-        };
-        self.reserve(len);
+        self.reserve(self.items.growth());
         self.try_insert(value)
             .map_err(|_| ())
             .expect("inserting will always succeed after reserving additional space")
@@ -531,8 +511,7 @@ impl<T> Arena<T> {
 
     #[inline(never)]
     fn insert_with_slow_path(&mut self, create: impl FnOnce(Index) -> T) -> Index {
-        let len = self.items.len();
-        self.reserve(len);
+        self.reserve(self.items.growth());
         self.try_insert_with(create)
             .map_err(|_| ())
             .expect("inserting will always succeed after reserving additional space")
@@ -737,14 +716,7 @@ impl<T> Arena<T> {
             return (self.get_mut(i1), None);
         }
 
-        let (raw_item1, raw_item2) = {
-            let (xs, ys) = self.items.split_at_mut(cmp::max(i1.slot(), i2.slot()));
-            if i1.slot() < i2.slot() {
-                (&mut xs[i1.slot()], &mut ys[0])
-            } else {
-                (&mut ys[0], &mut xs[i2.slot()])
-            }
-        };
+        let [raw_item1, raw_item2] = self.items.pair_mut(i1.slot(), i2.slot());
 
         let item1 = match raw_item1 {
             Entry::Occupied {
@@ -858,7 +830,6 @@ impl<T> Arena<T> {
         let start = self.items.len();
         let end = self.items.len() + additional_capacity;
         let old_head = self.free_list_head;
-        self.items.reserve_exact(additional_capacity);
         self.items.extend((start..end).map(|i| {
             if i == end - 1 {
                 Entry::Free {
@@ -893,12 +864,18 @@ impl<T> Arena<T> {
         let end = self
             .items
             .iter()
-            .rposition(|entry| matches!(entry, Entry::Occupied { .. }))
-            .map_or(0, |last| last + 1);
+            .rev()
+            .find(|(_, entry)| matches!(entry, Entry::Occupied { .. }))
+            .map_or(0, |(last, _)| last + 1);
         self.items.truncate(end);
         self.items.shrink_to_fit();
+        self.relink_free_list();
+    }
+
+    /// Links the free slots in ascending order.
+    fn relink_free_list(&mut self) {
         self.free_list_head = None;
-        for (i, entry) in self.items.iter_mut().enumerate().rev() {
+        for (i, entry) in self.items.iter_mut().rev() {
             if let Entry::Free { next_free } = entry {
                 *next_free = self.free_list_head;
                 self.free_list_head = Some(i);
@@ -929,7 +906,7 @@ impl<T> Arena<T> {
     pub fn iter(&self) -> Iter<T> {
         Iter {
             len: self.len,
-            inner: self.items.iter().enumerate(),
+            inner: self.items.iter(),
         }
     }
 
@@ -956,7 +933,7 @@ impl<T> Arena<T> {
     pub fn iter_mut(&mut self) -> IterMut<T> {
         IterMut {
             len: self.len,
-            inner: self.items.iter_mut().enumerate(),
+            inner: self.items.iter_mut(),
         }
     }
 
@@ -996,7 +973,7 @@ impl<T> Arena<T> {
         self.len = 0;
         Drain {
             len: old_len,
-            inner: self.items.drain(..).enumerate(),
+            inner: self.items.drain(),
         }
     }
 
@@ -1075,7 +1052,7 @@ impl<T> IntoIterator for Arena<T> {
 #[derive(Clone, Debug)]
 pub struct IntoIter<T> {
     len: usize,
-    inner: vec::IntoIter<Entry<T>>,
+    inner: SlotIntoIter<T>,
 }
 
 impl<T> Iterator for IntoIter<T> {
@@ -1159,7 +1136,7 @@ impl<'a, T> IntoIterator for &'a Arena<T> {
 #[derive(Clone, Debug)]
 pub struct Iter<'a, T: 'a> {
     len: usize,
-    inner: iter::Enumerate<slice::Iter<'a, Entry<T>>>,
+    inner: SlotIter<'a, T>,
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
@@ -1257,7 +1234,7 @@ impl<'a, T> IntoIterator for &'a mut Arena<T> {
 #[derive(Debug)]
 pub struct IterMut<'a, T: 'a> {
     len: usize,
-    inner: iter::Enumerate<slice::IterMut<'a, Entry<T>>>,
+    inner: SlotIterMut<'a, T>,
 }
 
 impl<'a, T> Iterator for IterMut<'a, T> {
@@ -1352,7 +1329,7 @@ impl<'a, T> FusedIterator for IterMut<'a, T> {}
 #[derive(Debug)]
 pub struct Drain<'a, T: 'a> {
     len: usize,
-    inner: iter::Enumerate<vec::Drain<'a, Entry<T>>>,
+    inner: SlotDrain<'a, T>,
 }
 
 impl<'a, T> Iterator for Drain<'a, T> {
