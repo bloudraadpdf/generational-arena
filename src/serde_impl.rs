@@ -37,9 +37,9 @@ where
     {
         // Note: do not change the serialization format, or it may break
         // forward and backward compatibility of serialized data!
-        serializer.collect_seq(self.items.iter().map(|(_, entry)| match entry {
-            Entry::Occupied { generation, value } => Some((generation.value(), value)),
-            Entry::Free { .. } => None,
+        serializer.collect_seq((0..self.items.len()).map(|slot| match self.items.get(slot) {
+            Some(Entry::Occupied { generation, value }) => Some((generation.value(), value)),
+            _ => None,
         }))
     }
 }

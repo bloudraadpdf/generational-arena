@@ -185,6 +185,7 @@ pub struct Arena<T> {
 enum Entry<T> {
     Free { next_free: Option<usize> },
     Occupied { generation: Generation, value: T },
+    Released,
 }
 
 /// A generation stored as its value plus 1, so that an `Option<Index>` needs no tag.
@@ -518,9 +519,7 @@ impl<T: Clone> Arena<T> {
     /// assert_eq!(arena.capacity(), 2);
     /// ```
     pub fn clear(&mut self) {
-        for (_, entry) in self.items.iter_mut() {
-            *entry = Entry::Free { next_free: None };
-        }
+        self.items.free_all();
         if !self.is_empty() {
             // Increment generation, but if there are no elements, do nothing to
             // avoid unnecessary incrementing generation.
@@ -616,7 +615,7 @@ impl<T: Clone> Arena<T> {
         match self.free_list_head {
             None => None,
             Some(i) => match self.items[i] {
-                Entry::Occupied { .. } => panic!("corrupt free list"),
+                Entry::Occupied { .. } | Entry::Released => panic!("corrupt free list"),
                 Entry::Free { next_free } => {
                     self.free_list_head = next_free;
                     self.len += 1;
@@ -705,12 +704,8 @@ impl<T: Clone> Arena<T> {
     /// assert_eq!(arena.remove(idx), None);
     /// ```
     pub fn remove(&mut self, i: Index) -> Option<T> {
-        if i.slot() >= self.items.len() {
-            return None;
-        }
-
-        match self.items[i.slot()] {
-            Entry::Occupied { generation, .. } if i.generation == generation => {
+        match self.items.get(i.slot()) {
+            Some(&Entry::Occupied { generation, .. }) if i.generation == generation => {
                 let entry = mem::replace(
                     &mut self.items[i.slot()],
                     Entry::Free { next_free: self.free_list_head },
@@ -721,6 +716,36 @@ impl<T: Clone> Arena<T> {
 
                 match entry {
                     Entry::Occupied { generation: _, value } => Some(value),
+                    _ => unreachable!(),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Removes the element at index `i` for good: no subsequent insertion takes its slot, also after
+    /// [`Arena::clear`] or [`Arena::shrink_to_fit`]. A chunk of slots that are all released gives back its memory.
+    ///
+    /// Returns the element, or `None` if `i` has no element.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use generational_arena::Arena;
+    ///
+    /// let mut arena = Arena::new();
+    /// let idx = arena.insert(42);
+    ///
+    /// assert_eq!(arena.release(idx), Some(42));
+    /// assert_eq!(arena.release(idx), None);
+    /// assert_ne!(arena.insert(43).into_raw_parts().0, idx.into_raw_parts().0);
+    /// ```
+    pub fn release(&mut self, i: Index) -> Option<T> {
+        match self.items.get(i.slot()) {
+            Some(&Entry::Occupied { generation, .. }) if i.generation == generation => {
+                self.len -= 1;
+                match self.items.release(i.slot()) {
+                    Entry::Occupied { value, .. } => Some(value),
                     _ => unreachable!(),
                 }
             }
@@ -748,8 +773,8 @@ impl<T: Clone> Arena<T> {
     /// ```
     pub fn retain(&mut self, mut predicate: impl FnMut(Index, &mut T) -> bool) {
         for i in 0..self.capacity() {
-            let remove = match &mut self.items[i] {
-                Entry::Occupied { generation, value } => {
+            let remove = match self.items.get_mut(i) {
+                Some(Entry::Occupied { generation, value }) => {
                     let index = Index::at(i, *generation);
                     if predicate(index, value) {
                         None
@@ -823,8 +848,6 @@ impl<T: Clone> Arena<T> {
     /// assert_eq!(arena[idx2], 4);
     /// ```
     pub fn get2_mut(&mut self, i1: Index, i2: Index) -> (Option<&mut T>, Option<&mut T>) {
-        let len = self.items.len();
-
         if i1.slot() == i2.slot() {
             assert!(i1.generation != i2.generation);
 
@@ -834,27 +857,21 @@ impl<T: Clone> Arena<T> {
             return (None, self.get_mut(i2));
         }
 
-        if i1.slot() >= len {
-            return (None, self.get_mut(i2));
-        } else if i2.slot() >= len {
-            return (self.get_mut(i1), None);
-        }
-
         let [raw_item1, raw_item2] = self.items.pair_mut(i1.slot(), i2.slot());
 
         let item1 = match raw_item1 {
-            Entry::Occupied {
+            Some(Entry::Occupied {
                 generation,
                 value,
-            } if *generation == i1.generation => Some(value),
+            }) if *generation == i1.generation => Some(value),
             _ => None,
         };
 
         let item2 = match raw_item2 {
-            Entry::Occupied {
+            Some(Entry::Occupied {
                 generation,
                 value,
-            } if *generation == i2.generation => Some(value),
+            }) if *generation == i2.generation => Some(value),
             _ => None,
         };
 
@@ -915,12 +932,7 @@ impl<T: Clone> Arena<T> {
     /// assert_eq!(arena[idx], 42);
     /// ```
     pub fn shrink_to_fit(&mut self) {
-        let end = self
-            .items
-            .iter()
-            .rev()
-            .find(|(_, entry)| matches!(entry, Entry::Occupied { .. }))
-            .map_or(0, |(last, _)| last + 1);
+        let end = self.items.taken_len();
         self.items.truncate(end);
         self.items.shrink_to_fit();
         self.relink_free_list();
@@ -1068,7 +1080,7 @@ impl<T> Iterator for IntoIter<T> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.inner.next() {
-                Some(Entry::Free { .. }) => continue,
+                Some(Entry::Free { .. } | Entry::Released) => continue,
                 Some(Entry::Occupied { value, .. }) => {
                     self.len -= 1;
                     return Some(value);
@@ -1090,7 +1102,7 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             match self.inner.next_back() {
-                Some(Entry::Free { .. }) => continue,
+                Some(Entry::Free { .. } | Entry::Released) => continue,
                 Some(Entry::Occupied { value, .. }) => {
                     self.len -= 1;
                     return Some(value);
@@ -1152,7 +1164,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.inner.next() {
-                Some((_, &Entry::Free { .. })) => continue,
+                Some((_, &Entry::Free { .. } | &Entry::Released)) => continue,
                 Some((
                     index,
                     &Entry::Occupied {
@@ -1181,7 +1193,7 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             match self.inner.next_back() {
-                Some((_, &Entry::Free { .. })) => continue,
+                Some((_, &Entry::Free { .. } | &Entry::Released)) => continue,
                 Some((
                     index,
                     &Entry::Occupied {
@@ -1250,7 +1262,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.inner.next() {
-                Some((_, &mut Entry::Free { .. })) => continue,
+                Some((_, &mut Entry::Free { .. } | &mut Entry::Released)) => continue,
                 Some((
                     index,
                     &mut Entry::Occupied {
@@ -1279,7 +1291,7 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             match self.inner.next_back() {
-                Some((_, &mut Entry::Free { .. })) => continue,
+                Some((_, &mut Entry::Free { .. } | &mut Entry::Released)) => continue,
                 Some((
                     index,
                     &mut Entry::Occupied {
@@ -1345,7 +1357,7 @@ impl<'a, T> Iterator for Drain<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.inner.next() {
-                Some((_, Entry::Free { .. })) => continue,
+                Some((_, Entry::Free { .. } | Entry::Released)) => continue,
                 Some((index, Entry::Occupied { generation, value })) => {
                     let idx = Index::at(index, generation);
                     self.len -= 1;
@@ -1368,7 +1380,7 @@ impl<'a, T> DoubleEndedIterator for Drain<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             match self.inner.next_back() {
-                Some((_, Entry::Free { .. })) => continue,
+                Some((_, Entry::Free { .. } | Entry::Released)) => continue,
                 Some((index, Entry::Occupied { generation, value })) => {
                     let idx = Index::at(index, generation);
                     self.len -= 1;

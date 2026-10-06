@@ -434,3 +434,43 @@ fn a_clone_shares_its_chunks_until_a_write() {
     assert_eq!(arena.remove(indices[4]), Some(Counted(4)));
     assert_eq!(copy[indices[4]], Counted(4));
 }
+
+#[test]
+fn a_released_slot_takes_no_subsequent_insertion() {
+    let mut arena = Arena::new();
+    let indices: Vec<_> = (0..1_000).map(|i| arena.insert(i)).collect();
+    let released: BTreeSet<_> = indices[100..900].iter().map(|index| index.into_raw_parts().0).collect();
+    for &index in &indices[100..900] {
+        assert!(arena.release(index).is_some());
+        assert!(arena.release(index).is_none());
+    }
+    assert_eq!(arena.len(), 200);
+    arena.shrink_to_fit();
+    arena.clear();
+    for i in 0..1_000 {
+        let slot = arena.insert(i).into_raw_parts().0;
+        assert!(!released.contains(&slot), "slot {} was released", slot);
+    }
+}
+
+#[test]
+fn released_slots_read_as_absent_and_keep_the_positions_of_the_others() {
+    let mut arena = Arena::new();
+    let indices: Vec<_> = (0..10_000).map(|i| arena.insert(i)).collect();
+    for &index in indices[1_000..9_000].iter().chain(&indices[9_990..]) {
+        arena.release(index);
+    }
+    let kept: Vec<_> = indices[..1_000].iter().chain(&indices[9_000..9_990]).copied().collect();
+    assert!(arena.iter().map(|(index, _)| index).eq(kept.iter().copied()));
+    assert!(arena.iter_mut().rev().map(|(index, _)| index).eq(kept.iter().rev().copied()));
+    let released = indices[5_000];
+    assert!(arena.get(released).is_none());
+    assert!(arena.remove(released).is_none());
+    assert!(arena.get_unknown_gen(released.into_raw_parts().0).is_none());
+    assert_eq!(arena.get2_mut(released, kept[0]).1.copied(), Some(0));
+    assert_eq!(arena.get2_mut(kept[1_000], released).0.copied(), Some(9_000));
+    arena.retain(|_, value| *value % 2 == 0);
+    assert_eq!(arena.len(), 995);
+    let even = (0..1_000).chain(9_000..9_990).filter(|value| value % 2 == 0);
+    assert!(arena.drain().map(|(_, value)| value).eq(even));
+}
