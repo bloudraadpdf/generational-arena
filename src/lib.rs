@@ -1256,7 +1256,7 @@ pub struct IterMut<'a, T: 'a> {
     inner: SlotIterMut<'a, T>,
 }
 
-impl<'a, T> Iterator for IterMut<'a, T> {
+impl<'a, T: Clone> Iterator for IterMut<'a, T> {
     type Item = (Index, &'a mut T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1287,7 +1287,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     }
 }
 
-impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
+impl<'a, T: Clone> DoubleEndedIterator for IterMut<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             match self.inner.next_back() {
@@ -1312,13 +1312,13 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
     }
 }
 
-impl<'a, T> ExactSizeIterator for IterMut<'a, T> {
+impl<'a, T: Clone> ExactSizeIterator for IterMut<'a, T> {
     fn len(&self) -> usize {
         self.len
     }
 }
 
-impl<'a, T> FusedIterator for IterMut<'a, T> {}
+impl<'a, T: Clone> FusedIterator for IterMut<'a, T> {}
 
 /// An iterator that removes elements from the arena.
 ///
