@@ -429,7 +429,7 @@ fn a_clone_shares_its_chunks_until_a_write() {
     copy[indices[5_000]] = Counted(0);
     // A write copies one chunk of 4 KiB, and an entry takes at least 16 bytes.
     let copied = CLONES.load(Ordering::Relaxed);
-    assert!(copied > 0 && copied <= 256, "{copied} clones");
+    assert!(copied > 0 && copied <= 256, "{} clones", copied);
     assert_eq!((&arena[indices[5_000]], &copy[indices[5_000]]), (&Counted(5_000), &Counted(0)));
     assert_eq!(arena.remove(indices[4]), Some(Counted(4)));
     assert_eq!(copy[indices[4]], Counted(4));

@@ -1,7 +1,6 @@
 #![cfg(feature = "serde")]
 
 extern crate generational_arena;
-#[macro_use]
 extern crate serde;
 extern crate bincode;
 extern crate serde_test;
@@ -145,10 +144,11 @@ fn arena_from_iter_can_be_serialized_and_deserialized_without_panic() {
 
     let mut vec = vec![0usize];
     let x = vec.drain(..);
-    let mut arena_in = Arena::from_iter(x);
+    let arena_in = Arena::from_iter(x);
 
     let ser = serde_yaml::to_string(&arena_in).unwrap();
     let arena_out: Arena<usize> = serde_yaml::from_str(&ser).unwrap();
+    assert_eq!(arena_out.iter().map(|(_, value)| *value).collect::<Vec<_>>(), [0]);
 }
 
 /// Arena wrapper struct for comparing two arenas
